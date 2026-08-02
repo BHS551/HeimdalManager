@@ -55,6 +55,19 @@ cat << 'EOF' > /home/ubuntu/app/context.json
 ${contextJson}
 EOF
 
+# Sync the latest worker scripts from S3 so every instance runs the current
+# version pushed from the harmsDetection repo. Both files download to temp
+# paths first and only replace the AMI's baked-in copies once both succeed,
+# so a failed/partial download can never leave a corrupt worker behind.
+/home/ubuntu/app/venv/bin/python3 - << 'SYNC' || echo "worker sync failed, using baked-in scripts"
+import boto3, shutil
+s3 = boto3.client("s3")
+s3.download_file("detection-frames-tests", "worker/heimdall-eye.py", "/tmp/main.py.new")
+s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/firebase_auth.py.new")
+shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
+shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
+SYNC
+
 nohup /home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py > /var/log/worker.log 2>&1 &
 `;
 
