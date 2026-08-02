@@ -34,6 +34,10 @@ if (!admin.apps.length) {
   });
 }
 
+// EC2 tag filters treat * and ? as wildcards; a strict allowlist keeps a
+// malicious taskId from matching (and terminating) other tasks' instances.
+const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
 function getBearerToken(event) {
   const authHeader =
     event?.headers?.Authorization || event?.headers?.authorization;
@@ -45,7 +49,40 @@ function getBearerToken(event) {
   return authHeader.slice("Bearer ".length).trim();
 }
 
-async function startInstance(taskId, context) {
+async function findTaskInstances(taskId, ownerUid, states) {
+  const described = await ec2.send(
+    new DescribeInstancesCommand({
+      Filters: [
+        { Name: "tag:TaskId", Values: [String(taskId)] },
+        { Name: "tag:Project", Values: ["PythonWorkers"] },
+        { Name: "tag:OwnerUid", Values: [String(ownerUid)] },
+        { Name: "instance-state-name", Values: states },
+      ],
+    })
+  );
+  return (described.Reservations ?? []).flatMap((r) =>
+    (r.Instances ?? []).map((i) => i.InstanceId)
+  );
+}
+
+async function startInstance(taskId, context, ownerUid) {
+  // Idempotent: if this task already has a live worker, return it instead of
+  // stacking a duplicate instance.
+  const existing = await findTaskInstances(taskId, ownerUid, ["pending", "running"]);
+  if (existing.length > 0) {
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({
+        ok: true,
+        action: "start",
+        instanceId: existing[0],
+        taskId,
+        alreadyRunning: true,
+      }),
+    };
+  }
+
   const contextJson = JSON.stringify(context);
 
   const userDataScript = `#!/bin/bash
@@ -87,6 +124,7 @@ nohup /home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py > /var/log/worker.l
             { Key: "Name", Value: `worker-${taskId}` },
             { Key: "Project", Value: "PythonWorkers" },
             { Key: "TaskId", Value: taskId },
+            { Key: "OwnerUid", Value: ownerUid },
           ],
         },
       ],
@@ -107,24 +145,15 @@ nohup /home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py > /var/log/worker.l
   };
 }
 
-async function stopInstances(taskId) {
-  // Busca las instancias worker de esta tarea que aún no están terminadas.
-  const described = await ec2.send(
-    new DescribeInstancesCommand({
-      Filters: [
-        { Name: "tag:TaskId", Values: [String(taskId)] },
-        { Name: "tag:Project", Values: ["PythonWorkers"] },
-        {
-          Name: "instance-state-name",
-          Values: ["pending", "running", "stopping", "stopped"],
-        },
-      ],
-    })
-  );
-
-  const instanceIds = (described.Reservations ?? []).flatMap((r) =>
-    (r.Instances ?? []).map((i) => i.InstanceId)
-  );
+async function stopInstances(taskId, ownerUid) {
+  // Busca las instancias worker de esta tarea (solo las del dueño autenticado)
+  // que aún no están terminadas.
+  const instanceIds = await findTaskInstances(taskId, ownerUid, [
+    "pending",
+    "running",
+    "stopping",
+    "stopped",
+  ]);
 
   if (instanceIds.length === 0) {
     // Nada que apagar: se considera éxito para que el switch quede apagado.
@@ -182,7 +211,8 @@ export const handler = async (event) => {
       };
     }
 
-    await admin.auth().verifyIdToken(token);
+    const decoded = await admin.auth().verifyIdToken(token);
+    const ownerUid = decoded.uid;
 
     let taskId = Date.now().toString();
     let context = {
@@ -194,17 +224,38 @@ export const handler = async (event) => {
     };
     let taskIdProvided = false;
 
-    try {
-      const body = typeof event.body === "string" ? JSON.parse(event.body) : (event.body || {});
-      if (body.action) action = body.action;
-      if (body.taskId) {
-        taskId = body.taskId;
-        taskIdProvided = true;
+    // Un body que no se puede interpretar es un 400, nunca un fallback a
+    // "start": un stop malformado no debe lanzar una instancia nueva.
+    let body = {};
+    if (event.body != null) {
+      try {
+        const rawBody = event.isBase64Encoded
+          ? Buffer.from(event.body, "base64").toString("utf8")
+          : event.body;
+        body = typeof rawBody === "string" ? JSON.parse(rawBody) : (rawBody || {});
+      } catch (e) {
+        console.warn("Could not parse body:", e);
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({ message: "Invalid JSON body" }),
+        };
       }
-      if (body.context) context = body.context;
-    } catch (e) {
-      console.warn("Could not parse body:", e);
     }
+
+    if (body.action) action = body.action;
+    if (body.taskId) {
+      taskId = String(body.taskId);
+      taskIdProvided = true;
+      if (!TASK_ID_PATTERN.test(taskId)) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({ message: "Invalid taskId" }),
+        };
+      }
+    }
+    if (body.context) context = body.context;
 
     if (action === "stop") {
       if (!taskIdProvided) {
@@ -214,7 +265,7 @@ export const handler = async (event) => {
           body: JSON.stringify({ message: "taskId is required to stop instances" }),
         };
       }
-      return await stopInstances(taskId);
+      return await stopInstances(taskId, ownerUid);
     }
 
     if (action !== "start") {
@@ -225,11 +276,13 @@ export const handler = async (event) => {
       };
     }
 
-    return await startInstance(taskId, context);
+    return await startInstance(taskId, context, ownerUid);
   } catch (err) {
-    const isAuthError =
-      err?.code?.startsWith?.("auth/") ||
-      err?.message?.toLowerCase?.().includes("token");
+    // Solo los errores de firebase-admin (code "auth/...") son 401; buscar
+    // "token" en el mensaje confundía errores de credenciales del SDK de AWS
+    // ("The security token included in the request is invalid") con fallos de
+    // autenticación del usuario.
+    const isAuthError = err?.code?.startsWith?.("auth/") === true;
 
     return {
       statusCode: isAuthError ? 401 : 500,
