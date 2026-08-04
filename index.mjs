@@ -6,8 +6,12 @@ import {
   DescribeInstancesCommand,
   TerminateInstancesCommand,
 } from "@aws-sdk/client-ec2";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
 
 const ec2 = new EC2Client({ region: process.env.AWS_REGION || "us-east-1" });
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const SUBSCRIPTIONS_TABLE = "subscriptions";
 
 const headers = {
   "Content-Type": "application/json",
@@ -68,7 +72,32 @@ async function findTaskInstances(taskId, ownerUid, states) {
   );
 }
 
-async function startInstance(taskId, context, ownerUid, scopeUid) {
+// Cuenta los workers vivos (pending/running) de un usuario, para aplicar el
+// tope de cámaras del plan del lado del servidor.
+async function countOwnerRunningInstances(ownerUid) {
+  const described = await ec2.send(
+    new DescribeInstancesCommand({
+      Filters: [
+        { Name: "tag:Project", Values: ["PythonWorkers"] },
+        { Name: "tag:OwnerUid", Values: [String(ownerUid)] },
+        { Name: "instance-state-name", Values: ["pending", "running"] },
+      ],
+    })
+  );
+  return (described.Reservations ?? []).reduce(
+    (sum, r) => sum + (r.Instances ?? []).length,
+    0
+  );
+}
+
+async function getSubscription(ownerUid) {
+  const res = await ddb.send(
+    new GetCommand({ TableName: SUBSCRIPTIONS_TABLE, Key: { uid: ownerUid } })
+  );
+  return res.Item ?? null;
+}
+
+async function startInstance(taskId, context, ownerUid, scopeUid, isAdmin) {
   // Idempotent: if this task already has a live worker, return it instead of
   // stacking a duplicate instance.
   const existing = await findTaskInstances(taskId, scopeUid, ["pending", "running"]);
@@ -84,6 +113,34 @@ async function startInstance(taskId, context, ownerUid, scopeUid) {
         alreadyRunning: true,
       }),
     };
+  }
+
+  // Enforcement de plan del lado del servidor. El chequeo del navegador es solo
+  // de UX; sin esto, cualquier usuario con token podría encender workers sin
+  // plan (saltándose el cobro) y sin límite (disparando la factura de EC2).
+  // Los administradores tienen override total.
+  if (!isAdmin) {
+    const subscription = await getSubscription(ownerUid);
+    if (!subscription || subscription.status !== "active") {
+      return {
+        statusCode: 403,
+        headers,
+        body: JSON.stringify({
+          message: "Necesitas un plan activo para encender el monitoreo.",
+        }),
+      };
+    }
+    const maxCameras = Number(subscription.maxCameras) || 0;
+    const running = await countOwnerRunningInstances(ownerUid);
+    if (running >= maxCameras) {
+      return {
+        statusCode: 403,
+        headers,
+        body: JSON.stringify({
+          message: `Alcanzaste el límite de tu plan (${maxCameras} cámaras monitoreadas). Apaga otra cámara o mejora tu plan.`,
+        }),
+      };
+    }
   }
 
   const contextJson = JSON.stringify(context);
@@ -216,9 +273,10 @@ export const handler = async (event) => {
 
     const decoded = await admin.auth().verifyIdToken(token);
     const ownerUid = decoded.uid;
+    const isAdmin = decoded.role === "admin";
     // Los administradores (custom claim role=admin, firmado en el token)
     // pueden apagar instancias de cualquier usuario.
-    const scopeUid = decoded.role === "admin" ? null : ownerUid;
+    const scopeUid = isAdmin ? null : ownerUid;
 
     let taskId = Date.now().toString();
     let context = {
@@ -282,7 +340,7 @@ export const handler = async (event) => {
       };
     }
 
-    return await startInstance(taskId, context, ownerUid, scopeUid);
+    return await startInstance(taskId, context, ownerUid, scopeUid, isAdmin);
   } catch (err) {
     // Solo los errores de firebase-admin (code "auth/...") son 401; buscar
     // "token" en el mensaje confundía errores de credenciales del SDK de AWS
