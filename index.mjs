@@ -50,25 +50,28 @@ function getBearerToken(event) {
 }
 
 async function findTaskInstances(taskId, ownerUid, states) {
+  const filters = [
+    { Name: "tag:TaskId", Values: [String(taskId)] },
+    { Name: "tag:Project", Values: ["PythonWorkers"] },
+    { Name: "instance-state-name", Values: states },
+  ];
+  // ownerUid null = sin filtro de dueño (administradores operan sobre
+  // cualquier instancia; los demás usuarios solo sobre las suyas).
+  if (ownerUid) {
+    filters.push({ Name: "tag:OwnerUid", Values: [String(ownerUid)] });
+  }
   const described = await ec2.send(
-    new DescribeInstancesCommand({
-      Filters: [
-        { Name: "tag:TaskId", Values: [String(taskId)] },
-        { Name: "tag:Project", Values: ["PythonWorkers"] },
-        { Name: "tag:OwnerUid", Values: [String(ownerUid)] },
-        { Name: "instance-state-name", Values: states },
-      ],
-    })
+    new DescribeInstancesCommand({ Filters: filters })
   );
   return (described.Reservations ?? []).flatMap((r) =>
     (r.Instances ?? []).map((i) => i.InstanceId)
   );
 }
 
-async function startInstance(taskId, context, ownerUid) {
+async function startInstance(taskId, context, ownerUid, scopeUid) {
   // Idempotent: if this task already has a live worker, return it instead of
   // stacking a duplicate instance.
-  const existing = await findTaskInstances(taskId, ownerUid, ["pending", "running"]);
+  const existing = await findTaskInstances(taskId, scopeUid, ["pending", "running"]);
   if (existing.length > 0) {
     return {
       statusCode: 200,
@@ -145,10 +148,10 @@ nohup /home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py > /var/log/worker.l
   };
 }
 
-async function stopInstances(taskId, ownerUid) {
-  // Busca las instancias worker de esta tarea (solo las del dueño autenticado)
-  // que aún no están terminadas.
-  const instanceIds = await findTaskInstances(taskId, ownerUid, [
+async function stopInstances(taskId, scopeUid) {
+  // Busca las instancias worker de esta tarea que aún no están terminadas
+  // (los usuarios normales solo ven las suyas; los admins, todas).
+  const instanceIds = await findTaskInstances(taskId, scopeUid, [
     "pending",
     "running",
     "stopping",
@@ -213,6 +216,9 @@ export const handler = async (event) => {
 
     const decoded = await admin.auth().verifyIdToken(token);
     const ownerUid = decoded.uid;
+    // Los administradores (custom claim role=admin, firmado en el token)
+    // pueden apagar instancias de cualquier usuario.
+    const scopeUid = decoded.role === "admin" ? null : ownerUid;
 
     let taskId = Date.now().toString();
     let context = {
@@ -265,7 +271,7 @@ export const handler = async (event) => {
           body: JSON.stringify({ message: "taskId is required to stop instances" }),
         };
       }
-      return await stopInstances(taskId, ownerUid);
+      return await stopInstances(taskId, scopeUid);
     }
 
     if (action !== "start") {
@@ -276,7 +282,7 @@ export const handler = async (event) => {
       };
     }
 
-    return await startInstance(taskId, context, ownerUid);
+    return await startInstance(taskId, context, ownerUid, scopeUid);
   } catch (err) {
     // Solo los errores de firebase-admin (code "auth/...") son 401; buscar
     // "token" en el mensaje confundía errores de credenciales del SDK de AWS
