@@ -7,6 +7,7 @@
 //   usuario identificado por correo o uid. El rol admin viene del custom
 //   claim { role: "admin" } firmado dentro del ID token.
 import admin from "firebase-admin";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 
@@ -25,22 +26,44 @@ const headers = {
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 };
 
-if (
-  !process.env.FIREBASE_PROJECT_ID ||
-  !process.env.FIREBASE_CLIENT_EMAIL ||
-  !process.env.FIREBASE_PRIVATE_KEY
-) {
-  throw new Error("Missing Firebase environment variables");
-}
+// firebase-admin: la credencial se lee de Secrets Manager (heimdall/firebase)
+// en lugar de variables de entorno. Cae a las env vars solo si el secreto no
+// está disponible, para permitir un rollback seguro.
+const secretsClient = new SecretsManagerClient({
+  region: process.env.AWS_REGION || "us-east-1",
+});
+const FIREBASE_SECRET_ID = process.env.FIREBASE_SECRET_ID || "heimdall/firebase";
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    }),
-  });
+let firebaseReady = null;
+function ensureFirebase() {
+  if (!firebaseReady) {
+    firebaseReady = (async () => {
+      if (admin.apps.length) return;
+      let sa = null;
+      try {
+        const res = await secretsClient.send(
+          new GetSecretValueCommand({ SecretId: FIREBASE_SECRET_ID })
+        );
+        const secret = JSON.parse(res.SecretString);
+        sa = secret.service_account || secret;
+      } catch (e) {
+        if (!process.env.FIREBASE_PRIVATE_KEY) throw e;
+      }
+      const credential = sa
+        ? admin.credential.cert({
+            projectId: sa.project_id,
+            clientEmail: sa.client_email,
+            privateKey: sa.private_key,
+          })
+        : admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+          });
+      admin.initializeApp({ credential });
+    })();
+  }
+  return firebaseReady;
 }
 
 function getBearerToken(event) {
@@ -72,6 +95,7 @@ export const handler = async (event) => {
     if (!token) {
       return response(401, { message: "Unauthorized: missing token" });
     }
+    await ensureFirebase();
     const decoded = await admin.auth().verifyIdToken(token);
     const isAdmin = decoded.role === "admin";
 

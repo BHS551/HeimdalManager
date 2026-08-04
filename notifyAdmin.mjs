@@ -5,6 +5,7 @@
 //  - {type:"plan_request", planId}           (requiere token Firebase; reemplaza
 //    temporalmente el pago: el admin activa el plan a mano)
 import admin from "firebase-admin";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 
 const sns = new SNSClient({ region: process.env.AWS_REGION || "us-east-1" });
@@ -16,23 +17,48 @@ const headers = {
   "Access-Control-Allow-Methods": "POST,OPTIONS",
 };
 
-if (
-  !process.env.FIREBASE_PROJECT_ID ||
-  !process.env.FIREBASE_CLIENT_EMAIL ||
-  !process.env.FIREBASE_PRIVATE_KEY ||
-  !process.env.TOPIC_ARN
-) {
-  throw new Error("Missing environment variables");
+if (!process.env.TOPIC_ARN) {
+  throw new Error("Missing TOPIC_ARN environment variable");
 }
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    }),
-  });
+// firebase-admin: la credencial se lee de Secrets Manager (heimdall/firebase)
+// en lugar de variables de entorno. Cae a las env vars solo si el secreto no
+// está disponible, para permitir un rollback seguro.
+const secretsClient = new SecretsManagerClient({
+  region: process.env.AWS_REGION || "us-east-1",
+});
+const FIREBASE_SECRET_ID = process.env.FIREBASE_SECRET_ID || "heimdall/firebase";
+
+let firebaseReady = null;
+function ensureFirebase() {
+  if (!firebaseReady) {
+    firebaseReady = (async () => {
+      if (admin.apps.length) return;
+      let sa = null;
+      try {
+        const res = await secretsClient.send(
+          new GetSecretValueCommand({ SecretId: FIREBASE_SECRET_ID })
+        );
+        const secret = JSON.parse(res.SecretString);
+        sa = secret.service_account || secret;
+      } catch (e) {
+        if (!process.env.FIREBASE_PRIVATE_KEY) throw e;
+      }
+      const credential = sa
+        ? admin.credential.cert({
+            projectId: sa.project_id,
+            clientEmail: sa.client_email,
+            privateKey: sa.private_key,
+          })
+        : admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+          });
+      admin.initializeApp({ credential });
+    })();
+  }
+  return firebaseReady;
 }
 
 // Catálogo mínimo para armar el correo; la fuente de verdad sigue siendo
@@ -120,6 +146,7 @@ export const handler = async (event) => {
       if (!token) {
         return response(401, { message: "Unauthorized: missing token" });
       }
+      await ensureFirebase();
       const decoded = await admin.auth().verifyIdToken(token);
 
       const planId = clean(body.planId, 50);
