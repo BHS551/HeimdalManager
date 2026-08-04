@@ -138,7 +138,7 @@ export const handler = async (event) => {
           `Correo: ${decoded.email || "(sin correo)"}`,
           `Nombre: ${decoded.name || "(sin nombre)"}`,
           "",
-          "Actívalo creando/actualizando su suscripción en Firestore.",
+          "Actívalo desde la consola: pestaña Admin (/console/admin), pega el correo y elige el plan.",
         ].join("\n")
       );
       return response(200, {
