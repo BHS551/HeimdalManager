@@ -185,31 +185,22 @@ async function startInstance(taskId, context, ownerUid, scopeUid, isAdmin) {
     }
   }
 
-  // La URL RTSP real (con credenciales) se lee de Secrets Manager por
-  // dispositivo, no del navegador: el cliente ya no la envía. Si el secreto no
-  // existe (dispositivo antiguo o UI vieja en caché) se usa la del body como
-  // compatibilidad temporal.
-  try {
-    const res = await secretsClient.send(
-      new GetSecretValueCommand({ SecretId: `heimdall/rtsp/${taskId}` })
-    );
-    if (res.SecretString) {
-      context = { ...context, rtsp_path: res.SecretString };
-    }
-  } catch (e) {
-    if (e?.name !== "ResourceNotFoundException") {
-      console.warn("No se pudo leer el secreto RTSP:", e?.name || e?.message);
-    }
-  }
+  // El worker obtiene la URL RTSP directamente de Secrets Manager por
+  // referencia: pasamos solo el id del secreto, nunca la credencial. Así no
+  // queda en el UserData ni en context.json en disco.
+  context = { ...context, rtsp_secret_id: `heimdall/rtsp/${taskId}` };
+  delete context.rtsp_path; // por si un cliente viejo la envió en el body
 
   const contextJson = JSON.stringify(context);
 
   const userDataScript = `#!/bin/bash
+set -e
 cd /home/ubuntu/app/
 
 cat << 'EOF' > /home/ubuntu/app/context.json
 ${contextJson}
 EOF
+chown ubuntu:ubuntu /home/ubuntu/app/context.json
 
 # Sync the latest worker scripts from S3 so every instance runs the current
 # version pushed from the harmsDetection repo. Both files download to temp
@@ -223,8 +214,35 @@ s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/fire
 shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
 shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
 SYNC
+chown ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py 2>/dev/null || true
 
-nohup /home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py > /var/log/worker.log 2>&1 &
+# systemd: el worker se reinicia solo si se cae (antes era un nohup sin supervisión).
+# El propio worker se auto-termina si la cámara no conecta, así que el límite de
+# reintentos solo cubre crashes transitorios.
+cat << 'UNIT' > /etc/systemd/system/heimdall-worker.service
+[Unit]
+Description=Heimdall detection worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+ExecStart=/home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py /home/ubuntu/app/context.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/worker.log
+StandardError=append:/var/log/worker.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now heimdall-worker.service
 `;
 
   const res = await ec2.send(
