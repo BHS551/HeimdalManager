@@ -185,6 +185,23 @@ async function startInstance(taskId, context, ownerUid, scopeUid, isAdmin) {
     }
   }
 
+  // La URL RTSP real (con credenciales) se lee de Secrets Manager por
+  // dispositivo, no del navegador: el cliente ya no la envía. Si el secreto no
+  // existe (dispositivo antiguo o UI vieja en caché) se usa la del body como
+  // compatibilidad temporal.
+  try {
+    const res = await secretsClient.send(
+      new GetSecretValueCommand({ SecretId: `heimdall/rtsp/${taskId}` })
+    );
+    if (res.SecretString) {
+      context = { ...context, rtsp_path: res.SecretString };
+    }
+  } catch (e) {
+    if (e?.name !== "ResourceNotFoundException") {
+      console.warn("No se pudo leer el secreto RTSP:", e?.name || e?.message);
+    }
+  }
+
   const contextJson = JSON.stringify(context);
 
   const userDataScript = `#!/bin/bash
