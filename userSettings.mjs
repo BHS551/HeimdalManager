@@ -60,6 +60,25 @@ function ensureFirebase() {
   return firebaseReady;
 }
 
+// CORS: refleja el origen solo si está permitido (dominio de la app + previews
+// de Vercel + localhost). Configurable con ALLOWED_ORIGINS (lista separada por
+// comas). Antes se enviaba "*" a cualquier origen.
+const STATIC_ALLOWED = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_ORIGIN =
+  STATIC_ALLOWED[0] || "https://harms-detection-landing-ui-seven.vercel.app";
+function allowOrigin(event) {
+  const origin =
+    event?.headers?.origin || event?.headers?.Origin || "";
+  const ok =
+    STATIC_ALLOWED.includes(origin) ||
+    /^https:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin) ||
+    /^http:\/\/localhost(:\d+)?$/i.test(origin);
+  return ok ? origin : DEFAULT_ORIGIN;
+}
+
 function getBearerToken(event) {
   const authHeader =
     event?.headers?.Authorization || event?.headers?.authorization;
@@ -75,6 +94,7 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^\+?[0-9()\-\s]{7,20}$/;
 
 export const handler = async (event) => {
+  headers["Access-Control-Allow-Origin"] = allowOrigin(event);
   const method =
     event?.requestContext?.http?.method || event?.httpMethod || "GET";
   if (method === "OPTIONS") {

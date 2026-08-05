@@ -65,6 +65,25 @@ function ensureFirebase() {
 // malicious taskId from matching (and terminating) other tasks' instances.
 const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
+// CORS: refleja el origen solo si está permitido (dominio de la app + previews
+// de Vercel + localhost). Configurable con ALLOWED_ORIGINS (lista separada por
+// comas). Antes se enviaba "*" a cualquier origen.
+const STATIC_ALLOWED = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_ORIGIN =
+  STATIC_ALLOWED[0] || "https://harms-detection-landing-ui-seven.vercel.app";
+function allowOrigin(event) {
+  const origin =
+    event?.headers?.origin || event?.headers?.Origin || "";
+  const ok =
+    STATIC_ALLOWED.includes(origin) ||
+    /^https:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin) ||
+    /^http:\/\/localhost(:\d+)?$/i.test(origin);
+  return ok ? origin : DEFAULT_ORIGIN;
+}
+
 function getBearerToken(event) {
   const authHeader =
     event?.headers?.Authorization || event?.headers?.authorization;
@@ -268,6 +287,7 @@ async function stopInstances(taskId, scopeUid) {
 }
 
 export const handler = async (event) => {
+  headers["Access-Control-Allow-Origin"] = allowOrigin(event);
   if (
     event?.requestContext?.http?.method === "OPTIONS" ||
     event?.httpMethod === "OPTIONS"
