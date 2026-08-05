@@ -25,6 +25,9 @@ const ses = new SESv2Client({ region: process.env.AWS_REGION || "us-east-1" });
 const STATUS_TABLE = "workerStatus";
 const USER_SETTINGS_TABLE = "userSettings";
 const SES_SENDER = process.env.SES_SENDER || ""; // remitente verificado en SES
+// Canal de email TEMPORAL mientras SES no está configurado: se publica al
+// tópico SNS del administrador (entrega a su correo confirmado).
+const ADMIN_TOPIC_ARN = process.env.ADMIN_TOPIC_ARN || "";
 
 const headers = {
   "Content-Type": "application/json",
@@ -112,29 +115,43 @@ async function sendUserNotification(ownerUid, info) {
       console.warn("SMS falló:", e?.name || e?.message);
     }
   }
-  if (settings.notificationEmail && SES_SENDER) {
-    try {
-      await ses.send(
-        new SendEmailCommand({
-          FromEmailAddress: SES_SENDER,
-          Destination: { ToAddresses: [settings.notificationEmail] },
-          Content: {
-            Simple: {
-              Subject: { Data: `SkyEye: ${info.event_type}` },
-              Body: {
-                Text: {
-                  Data:
-                    `${line}\n\nEvento: ${info.event_type}\nCámara: ${info.camera}\n` +
-                    `Confianza: ${info.cosine_sim ?? "-"}\nID: ${info.detection_id ?? "-"}`,
-                },
+  if (settings.notificationEmail) {
+    const emailBody =
+      `${line}\n\nDestinatario: ${settings.notificationEmail}\n` +
+      `Evento: ${info.event_type}\nCámara: ${info.camera}\n` +
+      `Confianza: ${info.cosine_sim ?? "-"}\nID: ${info.detection_id ?? "-"}`;
+    if (SES_SENDER) {
+      try {
+        await ses.send(
+          new SendEmailCommand({
+            FromEmailAddress: SES_SENDER,
+            Destination: { ToAddresses: [settings.notificationEmail] },
+            Content: {
+              Simple: {
+                Subject: { Data: `SkyEye: ${info.event_type}` },
+                Body: { Text: { Data: emailBody } },
               },
             },
-          },
-        })
-      );
-      delivered.push("email");
-    } catch (e) {
-      console.warn("Email (SES) falló:", e?.name || e?.message);
+          })
+        );
+        delivered.push("email");
+      } catch (e) {
+        console.warn("Email (SES) falló:", e?.name || e?.message);
+      }
+    } else if (ADMIN_TOPIC_ARN) {
+      // Fallback temporal: al no haber SES, se avisa por el tópico del admin.
+      try {
+        await sns.send(
+          new PublishCommand({
+            TopicArn: ADMIN_TOPIC_ARN,
+            Subject: `SkyEye: ${info.event_type}`.slice(0, 100),
+            Message: emailBody,
+          })
+        );
+        delivered.push("email-via-admin-topic");
+      } catch (e) {
+        console.warn("Email (SNS admin) falló:", e?.name || e?.message);
+      }
     }
   }
   return { delivered };
