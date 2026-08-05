@@ -206,15 +206,42 @@ chown ubuntu:ubuntu /home/ubuntu/app/context.json
 # version pushed from the harmsDetection repo. Both files download to temp
 # paths first and only replace the AMI's baked-in copies once both succeed,
 # so a failed/partial download can never leave a corrupt worker behind.
+mkdir -p /home/ubuntu/app/cascade
 /home/ubuntu/app/venv/bin/python3 - << 'SYNC' || echo "worker sync failed, using baked-in scripts"
 import boto3, shutil
 s3 = boto3.client("s3")
+# worker monolítico (fallback) + firebase_auth
 s3.download_file("detection-frames-tests", "worker/heimdall-eye.py", "/tmp/main.py.new")
 s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/firebase_auth.py.new")
 shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
 shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
+# cascada (motor por defecto): las 3 capas separadas
+for m in ["vision.py", "transport.py", "common.py", "vlm.py", "tiers.py", "run_pipeline.py"]:
+    s3.download_file("detection-frames-tests", f"worker/cascade/{m}", f"/tmp/{m}.new")
+    shutil.move(f"/tmp/{m}.new", f"/home/ubuntu/app/cascade/{m}")
+# firebase_auth también dentro de cascade (se importa desde ese directorio)
+shutil.copy("/home/ubuntu/firebase_auth.py", "/home/ubuntu/app/cascade/firebase_auth.py")
 SYNC
-chown ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py 2>/dev/null || true
+chown -R ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py /home/ubuntu/app/cascade 2>/dev/null || true
+
+# Lanzador: intenta la CASCADA (motor por defecto). Si sus módulos no importan
+# (despliegue incompleto), cae al worker MONOLÍTICO, de modo que un problema de la
+# cascada nunca deja la cámara sin detección.
+cat << 'LAUNCH' > /home/ubuntu/start-worker.sh
+#!/bin/bash
+APP=/home/ubuntu/app
+PY=\$APP/venv/bin/python3
+cd \$APP/cascade
+if [ -f run_pipeline.py ] && \$PY -c "import vision,transport,common,vlm,tiers,run_pipeline" 2>/tmp/cascade_import.err; then
+  echo "engine=cascade"
+  exec \$PY run_pipeline.py local \$APP/context.json
+else
+  echo "engine=monolith (fallo import cascade):"; cat /tmp/cascade_import.err
+  exec \$PY /home/ubuntu/main.py \$APP/context.json
+fi
+LAUNCH
+chmod +x /home/ubuntu/start-worker.sh
+chown ubuntu:ubuntu /home/ubuntu/start-worker.sh
 
 # systemd: el worker se reinicia solo si se cae (antes era un nohup sin supervisión).
 # El propio worker se auto-termina si la cámara no conecta, así que el límite de
@@ -231,7 +258,7 @@ StartLimitBurst=5
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/app
-ExecStart=/home/ubuntu/app/venv/bin/python3 /home/ubuntu/main.py /home/ubuntu/app/context.json
+ExecStart=/home/ubuntu/start-worker.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/worker.log
