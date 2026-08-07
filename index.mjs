@@ -14,6 +14,24 @@ const ec2 = new EC2Client({ region: process.env.AWS_REGION || "us-east-1" });
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const SUBSCRIPTIONS_TABLE = "subscriptions";
 
+// --- Cascada económica (Fase B): motion box barato 24/7 + analysis box compartida
+// que se levanta bajo demanda y se apaga sola tras 2h ociosa. Ambas usan el MISMO
+// launch template (misma AMI con venv/opencv/clip); solo cambia el InstanceType y el
+// modo de arranque, así no hace falta un template nuevo.
+const REGION = process.env.AWS_REGION || "us-east-1";
+const ACCOUNT_ID = process.env.ACCOUNT_ID || "780817326479";
+const CANDIDATE_QUEUE_URL =
+  process.env.HEIMDALL_CANDIDATE_QUEUE_URL ||
+  `https://sqs.${REGION}.amazonaws.com/${ACCOUNT_ID}/heimdall-candidates`;
+const VLM_QUEUE_URL =
+  process.env.HEIMDALL_VLM_QUEUE_URL ||
+  `https://sqs.${REGION}.amazonaws.com/${ACCOUNT_ID}/heimdall-vlm`;
+const ANALYSIS_INSTANCE_TYPE = process.env.ANALYSIS_INSTANCE_TYPE || "m7i-flex.large";
+const MOTION_INSTANCE_TYPE = process.env.MOTION_INSTANCE_TYPE || "t3.small";
+// Secreto compartido para acciones máquina-a-máquina (el motion box despierta la
+// analysis box). Sin token de usuario; se compara en tiempo constante-ish.
+const INTERNAL_SECRET = process.env.HEIMDALL_INTERNAL_SECRET || "";
+
 const headers = {
   "Content-Type": "application/json",
   "Access-Control-Allow-Origin": "*",
@@ -139,6 +157,98 @@ async function getSubscription(ownerUid) {
   return res.Item ?? null;
 }
 
+// Construye el UserData común (descarga scripts de S3 + systemd) parametrizado por
+// modo de arranque y variables de entorno. `mode`:
+//   "local"        -> las 3 capas en un proceso (1 cámara). Cae al monolito si la
+//                     cascada no importa (nunca deja una cámara sin detección).
+//   "analysis"     -> CLIP+VLM consumiendo SQS (analysis box compartida).
+//   "motion-multi" -> capa 0 de N cámaras -> SQS (motion box barato 24/7).
+function buildUserData(contextJson, { mode = "local", env = {} } = {}) {
+  const envLines = Object.entries(env)
+    .map(([k, v]) => `Environment=${k}=${v}`)
+    .join("\n");
+  // El monolito solo es fallback válido para "local" (worker por cámara). Para las
+  // cajas de la cascada, si la cascada no importa, se falla y systemd reintenta.
+  const launcher =
+    mode === "local"
+      ? `if [ -f run_pipeline.py ] && \\$PY -c "import vision,transport,common,vlm,tiers,run_pipeline" 2>/tmp/cascade_import.err; then
+  echo "engine=cascade mode=local"
+  exec \\$PY run_pipeline.py local \\$APP/context.json
+else
+  echo "engine=monolith (fallo import cascade):"; cat /tmp/cascade_import.err
+  exec \\$PY /home/ubuntu/main.py \\$APP/context.json
+fi`
+      : `echo "engine=cascade mode=${mode}"
+exec \\$PY run_pipeline.py ${mode} \\$APP/context.json`;
+
+  return `#!/bin/bash
+set -e
+cd /home/ubuntu/app/
+
+cat << 'EOF' > /home/ubuntu/app/context.json
+${contextJson}
+EOF
+chown ubuntu:ubuntu /home/ubuntu/app/context.json
+
+# Sync the latest worker scripts from S3 so every instance runs the current
+# version pushed from the harmsDetection repo. Both files download to temp
+# paths first and only replace the AMI's baked-in copies once both succeed,
+# so a failed/partial download can never leave a corrupt worker behind.
+mkdir -p /home/ubuntu/app/cascade
+/home/ubuntu/app/venv/bin/python3 - << 'SYNC' || echo "worker sync failed, using baked-in scripts"
+import boto3, shutil
+s3 = boto3.client("s3")
+# worker monolítico (fallback local) + firebase_auth
+s3.download_file("detection-frames-tests", "worker/heimdall-eye.py", "/tmp/main.py.new")
+s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/firebase_auth.py.new")
+shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
+shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
+# cascada: las capas separadas
+for m in ["vision.py", "transport.py", "common.py", "vlm.py", "tiers.py", "run_pipeline.py"]:
+    s3.download_file("detection-frames-tests", f"worker/cascade/{m}", f"/tmp/{m}.new")
+    shutil.move(f"/tmp/{m}.new", f"/home/ubuntu/app/cascade/{m}")
+shutil.copy("/home/ubuntu/firebase_auth.py", "/home/ubuntu/app/cascade/firebase_auth.py")
+SYNC
+chown -R ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py /home/ubuntu/app/cascade 2>/dev/null || true
+
+cat << 'LAUNCH' > /home/ubuntu/start-worker.sh
+#!/bin/bash
+APP=/home/ubuntu/app
+PY=\\$APP/venv/bin/python3
+cd \\$APP/cascade
+${launcher}
+LAUNCH
+chmod +x /home/ubuntu/start-worker.sh
+chown ubuntu:ubuntu /home/ubuntu/start-worker.sh
+
+cat << 'UNIT' > /etc/systemd/system/heimdall-worker.service
+[Unit]
+Description=Heimdall detection worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/app
+${envLines}
+ExecStart=/home/ubuntu/start-worker.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/worker.log
+StandardError=append:/var/log/worker.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now heimdall-worker.service
+`;
+}
+
 async function startInstance(taskId, context, ownerUid, scopeUid, isAdmin) {
   // Idempotent: if this task already has a live worker, return it instead of
   // stacking a duplicate instance.
@@ -192,85 +302,7 @@ async function startInstance(taskId, context, ownerUid, scopeUid, isAdmin) {
   delete context.rtsp_path; // por si un cliente viejo la envió en el body
 
   const contextJson = JSON.stringify(context);
-
-  const userDataScript = `#!/bin/bash
-set -e
-cd /home/ubuntu/app/
-
-cat << 'EOF' > /home/ubuntu/app/context.json
-${contextJson}
-EOF
-chown ubuntu:ubuntu /home/ubuntu/app/context.json
-
-# Sync the latest worker scripts from S3 so every instance runs the current
-# version pushed from the harmsDetection repo. Both files download to temp
-# paths first and only replace the AMI's baked-in copies once both succeed,
-# so a failed/partial download can never leave a corrupt worker behind.
-mkdir -p /home/ubuntu/app/cascade
-/home/ubuntu/app/venv/bin/python3 - << 'SYNC' || echo "worker sync failed, using baked-in scripts"
-import boto3, shutil
-s3 = boto3.client("s3")
-# worker monolítico (fallback) + firebase_auth
-s3.download_file("detection-frames-tests", "worker/heimdall-eye.py", "/tmp/main.py.new")
-s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/firebase_auth.py.new")
-shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
-shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
-# cascada (motor por defecto): las 3 capas separadas
-for m in ["vision.py", "transport.py", "common.py", "vlm.py", "tiers.py", "run_pipeline.py"]:
-    s3.download_file("detection-frames-tests", f"worker/cascade/{m}", f"/tmp/{m}.new")
-    shutil.move(f"/tmp/{m}.new", f"/home/ubuntu/app/cascade/{m}")
-# firebase_auth también dentro de cascade (se importa desde ese directorio)
-shutil.copy("/home/ubuntu/firebase_auth.py", "/home/ubuntu/app/cascade/firebase_auth.py")
-SYNC
-chown -R ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py /home/ubuntu/app/cascade 2>/dev/null || true
-
-# Lanzador: intenta la CASCADA (motor por defecto). Si sus módulos no importan
-# (despliegue incompleto), cae al worker MONOLÍTICO, de modo que un problema de la
-# cascada nunca deja la cámara sin detección.
-cat << 'LAUNCH' > /home/ubuntu/start-worker.sh
-#!/bin/bash
-APP=/home/ubuntu/app
-PY=\$APP/venv/bin/python3
-cd \$APP/cascade
-if [ -f run_pipeline.py ] && \$PY -c "import vision,transport,common,vlm,tiers,run_pipeline" 2>/tmp/cascade_import.err; then
-  echo "engine=cascade"
-  exec \$PY run_pipeline.py local \$APP/context.json
-else
-  echo "engine=monolith (fallo import cascade):"; cat /tmp/cascade_import.err
-  exec \$PY /home/ubuntu/main.py \$APP/context.json
-fi
-LAUNCH
-chmod +x /home/ubuntu/start-worker.sh
-chown ubuntu:ubuntu /home/ubuntu/start-worker.sh
-
-# systemd: el worker se reinicia solo si se cae (antes era un nohup sin supervisión).
-# El propio worker se auto-termina si la cámara no conecta, así que el límite de
-# reintentos solo cubre crashes transitorios.
-cat << 'UNIT' > /etc/systemd/system/heimdall-worker.service
-[Unit]
-Description=Heimdall detection worker
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=5
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/app
-ExecStart=/home/ubuntu/start-worker.sh
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:/var/log/worker.log
-StandardError=append:/var/log/worker.log
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now heimdall-worker.service
-`;
+  const userDataScript = buildUserData(contextJson, { mode: "local" });
 
   const res = await ec2.send(
     new RunInstancesCommand({
@@ -348,6 +380,156 @@ async function stopInstances(taskId, scopeUid) {
   };
 }
 
+function json(statusCode, obj) {
+  return { statusCode, headers, body: JSON.stringify(obj) };
+}
+
+function parseBody(event) {
+  if (event.body == null) return {};
+  const raw = event.isBase64Encoded
+    ? Buffer.from(event.body, "base64").toString("utf8")
+    : event.body;
+  return typeof raw === "string" ? JSON.parse(raw) : raw || {};
+}
+
+async function findInstancesByRole(role, states) {
+  const described = await ec2.send(
+    new DescribeInstancesCommand({
+      Filters: [
+        { Name: "tag:Project", Values: ["PythonWorkers"] },
+        { Name: "tag:Role", Values: [role] },
+        { Name: "instance-state-name", Values: states },
+      ],
+    })
+  );
+  return (described.Reservations ?? []).flatMap((r) =>
+    (r.Instances ?? []).map((i) => i.InstanceId)
+  );
+}
+
+// Levanta la ANALYSIS BOX (CLIP+VLM) si no hay una viva. Idempotente: el motion box
+// la llama en cada ráfaga (con debounce), pero nunca se stackea una segunda. La caja
+// se apaga sola tras 2h ociosa (watchdog del worker), así que este arranque solo
+// ocurre tras un silencio largo.
+async function ensureAnalysis() {
+  const running = await findInstancesByRole("analysis", ["pending", "running"]);
+  if (running.length > 0) {
+    return json(200, {
+      ok: true,
+      action: "ensureAnalysis",
+      instanceId: running[0],
+      alreadyRunning: true,
+    });
+  }
+  const ctx = {
+    idle_shutdown_seconds: Number(process.env.ANALYSIS_IDLE_SECONDS) || 7200,
+  };
+  const userData = buildUserData(JSON.stringify(ctx), {
+    mode: "analysis",
+    env: {
+      HEIMDALL_CANDIDATE_QUEUE_URL: CANDIDATE_QUEUE_URL,
+      HEIMDALL_VLM_QUEUE_URL: VLM_QUEUE_URL,
+    },
+  });
+  const res = await ec2.send(
+    new RunInstancesCommand({
+      LaunchTemplate: {
+        LaunchTemplateId: process.env.LAUNCH_TEMPLATE_ID,
+        Version: "$Latest",
+      },
+      InstanceType: ANALYSIS_INSTANCE_TYPE,
+      MinCount: 1,
+      MaxCount: 1,
+      UserData: Buffer.from(userData).toString("base64"),
+      TagSpecifications: [
+        {
+          ResourceType: "instance",
+          Tags: [
+            { Key: "Name", Value: "heimdall-analysis" },
+            { Key: "Project", Value: "PythonWorkers" },
+            { Key: "Role", Value: "analysis" },
+          ],
+        },
+      ],
+    })
+  );
+  return json(200, {
+    ok: true,
+    action: "ensureAnalysis",
+    instanceId: res.Instances?.[0]?.InstanceId,
+    started: true,
+  });
+}
+
+// Levanta el MOTION BOX barato 24/7 con un roster de cámaras. `cameras` = lista de
+// {id|device_id, camera_name, client_id, owner_uid, detection_blacklist?}. El RTSP se
+// resuelve por referencia al secreto heimdall/rtsp/<id> (nunca viaja la credencial).
+async function startMotionBox(cameras) {
+  if (!Array.isArray(cameras) || cameras.length === 0) {
+    return json(400, { message: "cameras[] requerido" });
+  }
+  const running = await findInstancesByRole("motion", ["pending", "running"]);
+  if (running.length > 0) {
+    return json(200, {
+      ok: true,
+      action: "startMotionBox",
+      instanceId: running[0],
+      alreadyRunning: true,
+    });
+  }
+  const roster = cameras.map((c) => {
+    const id = String(c.id || c.device_id || "");
+    return {
+      device_id: id,
+      camera_name: c.camera_name || c.name || "entrance",
+      client_id: c.client_id ?? 1,
+      owner_uid: c.owner_uid || "",
+      detection_blacklist: c.detection_blacklist || ["persona"],
+      rtsp_secret_id: c.rtsp_secret_id || (id ? `heimdall/rtsp/${id}` : undefined),
+      rtsp_path: c.rtsp_path,
+    };
+  });
+  const ctx = { cameras: roster, burst_frames: 10, burst_span: 3.0, burst_cooldown: 15.0 };
+  const userData = buildUserData(JSON.stringify(ctx), {
+    mode: "motion-multi",
+    env: {
+      HEIMDALL_CANDIDATE_QUEUE_URL: CANDIDATE_QUEUE_URL,
+      HEIMDAL_MANAGER_HOST:
+        process.env.SELF_HOST || "a2ukt8vyhb.execute-api.us-east-1.amazonaws.com",
+      HEIMDALL_INTERNAL_SECRET: INTERNAL_SECRET,
+    },
+  });
+  const res = await ec2.send(
+    new RunInstancesCommand({
+      LaunchTemplate: {
+        LaunchTemplateId: process.env.LAUNCH_TEMPLATE_ID,
+        Version: "$Latest",
+      },
+      InstanceType: MOTION_INSTANCE_TYPE,
+      MinCount: 1,
+      MaxCount: 1,
+      UserData: Buffer.from(userData).toString("base64"),
+      TagSpecifications: [
+        {
+          ResourceType: "instance",
+          Tags: [
+            { Key: "Name", Value: "heimdall-motion" },
+            { Key: "Project", Value: "PythonWorkers" },
+            { Key: "Role", Value: "motion" },
+          ],
+        },
+      ],
+    })
+  );
+  return json(200, {
+    ok: true,
+    action: "startMotionBox",
+    instanceId: res.Instances?.[0]?.InstanceId,
+    cameras: roster.length,
+    started: true,
+  });
+}
+
 export const handler = async (event) => {
   headers["Access-Control-Allow-Origin"] = allowOrigin(event);
   if (
@@ -366,6 +548,23 @@ export const handler = async (event) => {
   let action = "start";
 
   try {
+    // Ruta máquina-a-máquina (sin token de usuario): el motion box despierta la
+    // analysis box, o un script de cutover levanta la topología. Se autentica con un
+    // secreto compartido y se resuelve ANTES del token de usuario.
+    const internalSecret =
+      event?.headers?.["x-internal-secret"] || event?.headers?.["X-Internal-Secret"];
+    if (INTERNAL_SECRET && internalSecret && internalSecret === INTERNAL_SECRET) {
+      let ibody = {};
+      try {
+        ibody = parseBody(event);
+      } catch (e) {
+        return json(400, { message: "Invalid JSON body" });
+      }
+      if (ibody.action === "ensureAnalysis") return await ensureAnalysis();
+      if (ibody.action === "startMotionBox") return await startMotionBox(ibody.cameras);
+      return json(400, { message: `Unknown internal action: ${ibody.action}` });
+    }
+
     const token = getBearerToken(event);
 
     if (!token) {
