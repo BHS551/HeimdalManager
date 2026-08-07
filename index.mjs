@@ -171,15 +171,15 @@ function buildUserData(contextJson, { mode = "local", env = {} } = {}) {
   // cajas de la cascada, si la cascada no importa, se falla y systemd reintenta.
   const launcher =
     mode === "local"
-      ? `if [ -f run_pipeline.py ] && \\$PY -c "import vision,transport,common,vlm,tiers,run_pipeline" 2>/tmp/cascade_import.err; then
+      ? `if [ -f run_pipeline.py ] && \$PY -c "import vision,transport,common,vlm,tiers,run_pipeline" 2>/tmp/cascade_import.err; then
   echo "engine=cascade mode=local"
-  exec \\$PY run_pipeline.py local \\$APP/context.json
+  exec \$PY run_pipeline.py local \$APP/context.json
 else
   echo "engine=monolith (fallo import cascade):"; cat /tmp/cascade_import.err
-  exec \\$PY /home/ubuntu/main.py \\$APP/context.json
+  exec \$PY /home/ubuntu/main.py \$APP/context.json
 fi`
       : `echo "engine=cascade mode=${mode}"
-exec \\$PY run_pipeline.py ${mode} \\$APP/context.json`;
+exec \$PY run_pipeline.py ${mode} \$APP/context.json`;
 
   return `#!/bin/bash
 set -e
@@ -214,8 +214,8 @@ chown -R ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py /home/
 cat << 'LAUNCH' > /home/ubuntu/start-worker.sh
 #!/bin/bash
 APP=/home/ubuntu/app
-PY=\\$APP/venv/bin/python3
-cd \\$APP/cascade
+PY=\$APP/venv/bin/python3
+cd \$APP/cascade
 ${launcher}
 LAUNCH
 chmod +x /home/ubuntu/start-worker.sh
