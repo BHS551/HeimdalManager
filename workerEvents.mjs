@@ -5,9 +5,11 @@
 //                              configuró en "Mi cuenta" (userSettings).
 // action "status"    (UI):     el dueño consulta el estado en vivo de su cámara.
 //
-// El token Firebase se verifica siempre. Para heartbeat/notify el owner_uid
-// viene del cuerpo (lo pone el worker, backend de confianza con token de
-// servicio). Para status, el uid sale del token y solo ve lo suyo.
+// El token Firebase se verifica siempre. heartbeat/notify toman el owner_uid del
+// cuerpo, así que además EXIGEN que quien llama sea el worker (uid de servicio
+// WORKER_SERVICE_UID): verificar el token no basta, porque cualquiera puede
+// registrarse en la app y poner el uid ajeno que quiera en el body. Para status,
+// el uid sale del token y cada usuario solo ve lo suyo.
 import admin from "firebase-admin";
 import {
   SecretsManagerClient,
@@ -93,6 +95,18 @@ function getBearerToken(event) {
 }
 function response(statusCode, payload) {
   return { statusCode, headers, body: JSON.stringify(payload) };
+}
+
+// Identidad de servicio del worker: firebase_auth.py firma un custom token para el
+// uid "heimdall", así que las acciones que hablan en nombre de un tercero
+// (heartbeat y notify llevan owner_uid en el cuerpo) solo pueden venir de ahí.
+// Antes bastaba CUALQUIER token válido: como el registro de la app es abierto,
+// cualquier cuenta podía mandar SMS y correos al teléfono de otro usuario con solo
+// poner su uid en el body, o falsear el estado de sus cámaras.
+const WORKER_SERVICE_UID = process.env.WORKER_SERVICE_UID || "heimdall";
+
+function isWorker(decoded) {
+  return decoded?.uid === WORKER_SERVICE_UID || decoded?.role === "worker";
 }
 
 async function sendUserNotification(ownerUid, info) {
@@ -200,6 +214,14 @@ export const handler = async (event) => {
         body = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
       } catch {
         return response(400, { message: "Invalid JSON body" });
+      }
+    }
+
+    // heartbeat y notify actúan sobre el owner_uid que viaja en el cuerpo, así que
+    // exigen la identidad del worker; el token de un usuario normal no basta.
+    if (body.action === "heartbeat" || body.action === "notify") {
+      if (!isWorker(decoded)) {
+        return response(403, { message: "Solo el worker puede emitir eventos de dispositivo" });
       }
     }
 
