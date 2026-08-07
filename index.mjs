@@ -233,6 +233,7 @@ StartLimitBurst=5
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/app
+Environment=PYTHONUNBUFFERED=1
 ${envLines}
 ExecStart=/home/ubuntu/start-worker.sh
 Restart=on-failure
