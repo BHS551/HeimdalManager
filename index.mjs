@@ -204,12 +204,46 @@ s3.download_file("detection-frames-tests", "worker/firebase_auth.py", "/tmp/fire
 shutil.move("/tmp/main.py.new", "/home/ubuntu/main.py")
 shutil.move("/tmp/firebase_auth.py.new", "/home/ubuntu/firebase_auth.py")
 # cascada: las capas separadas
-for m in ["vision.py", "transport.py", "common.py", "vlm.py", "tiers.py", "run_pipeline.py"]:
+for m in ["vision.py", "transport.py", "common.py", "vlm.py", "tiers.py", "run_pipeline.py", "pose.py", "yoloe_scorer.py"]:
     s3.download_file("detection-frames-tests", f"worker/cascade/{m}", f"/tmp/{m}.new")
     shutil.move(f"/tmp/{m}.new", f"/home/ubuntu/app/cascade/{m}")
 shutil.copy("/home/ubuntu/firebase_auth.py", "/home/ubuntu/app/cascade/firebase_auth.py")
 SYNC
 chown -R ubuntu:ubuntu /home/ubuntu/main.py /home/ubuntu/firebase_auth.py /home/ubuntu/app/cascade 2>/dev/null || true
+
+# ultralytics: lo usa cascade/pose.py para resolver CAÍDAS por geometría corporal
+# dentro de Heimdall, sin gastar una llamada al VLM.
+#
+# CUIDADO: ultralytics depende de "opencv-python", que necesita libGL y SUSTITUYE
+# al "opencv-python-headless" que trae el AMI. Instalarlo sin más rompió el worker
+# entero: "import cv2" fallaba con libGL.so.1, la cascada no importaba y el
+# monolito de respaldo tampoco arrancaba. Por eso se instala SIN dependencias y se
+# reponen a mano solo las que faltan, dejando el opencv headless intacto.
+# Se instala CON dependencias (pip resuelve pyyaml, scipy, pandas... mejor que una
+# lista escrita a mano: intentarlo con --no-deps dejó a ultralytics sin PyYAML) y
+# acto seguido se repara opencv de forma determinista: fuera el paquete con GUI,
+# dentro el headless. El orden importa, porque ambos proveen el módulo "cv2".
+/home/ubuntu/app/venv/bin/pip install --no-input --quiet ultralytics 2>&1 | tail -3 || true
+/home/ubuntu/app/venv/bin/pip uninstall -y --quiet opencv-python opencv-contrib-python 2>&1 | tail -2 || true
+/home/ubuntu/app/venv/bin/pip install --no-input --quiet --force-reinstall opencv-python-headless 2>&1 | tail -3 || true
+/home/ubuntu/app/venv/bin/python3 -c "import cv2; print('[boot] cv2 OK', cv2.__version__)" || echo "[boot] AVISO: cv2 sigue roto"
+
+# Modelos de la capa 1, servidos desde S3 y NO desde GitHub: el arranque de cada
+# worker no puede depender de que releases de terceros estén disponibles.
+# El fichero mobileclip_blt.ts (572 MB) lo necesita YOLOE.set_classes() para embeber los
+# nombres de clase; si falta, ultralytics intenta bajarlo de internet en pleno
+# arranque. Se coloca en el cwd del proceso, que es donde lo busca.
+/home/ubuntu/app/venv/bin/python3 - << 'MODELS' || echo "[boot] AVISO: sin modelos de capa 1, se caera a CLIP"
+import boto3, os
+s3 = boto3.client("s3")
+os.makedirs("/home/ubuntu/app/cascade", exist_ok=True)
+for clave, destino in [("worker/models/yoloe-11s-seg.pt", "/home/ubuntu/app/cascade/yoloe-11s-seg.pt"),
+                       ("worker/models/mobileclip_blt.ts", "/home/ubuntu/app/cascade/mobileclip_blt.ts")]:
+    if not os.path.exists(destino):
+        s3.download_file("detection-frames-tests", clave, destino)
+        print("[boot] modelo", os.path.basename(destino), os.path.getsize(destino) // 1024, "KB")
+MODELS
+chown -R ubuntu:ubuntu /home/ubuntu/app/cascade 2>/dev/null || true
 
 cat << 'LAUNCH' > /home/ubuntu/start-worker.sh
 #!/bin/bash
