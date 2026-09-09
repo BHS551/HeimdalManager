@@ -555,7 +555,20 @@ export const handler = async (event) => {
     };
   }
 
-  console.log("Incoming event:", JSON.stringify(event));
+  // No se loguea el evento completo: los headers incluyen el token Firebase
+  // (Authorization) y el secreto interno (X-Internal-Secret). Se registran
+  // los headers salvo esos dos.
+  const {
+    Authorization: _auth,
+    authorization: _auth2,
+    "X-Internal-Secret": _xis,
+    "x-internal-secret": _xis2,
+    ...safeHeaders
+  } = event?.headers || {};
+  console.log(
+    "Incoming event:",
+    JSON.stringify({ ...event, headers: safeHeaders })
+  );
 
   let action = "start";
 
@@ -596,13 +609,10 @@ export const handler = async (event) => {
     const scopeUid = isAdmin ? null : ownerUid;
 
     let taskId = Date.now().toString();
-    let context = {
-      instance_id: 2,
-      client_id: 2,
-      camera_name: "entrance_instance",
-      detection_blacklist: ["person"],
-      rtsp_path: "rtsp://admin551:123456789@4.tcp.ngrok.io:17829/stream1",
-    };
+    // No hay contexto demo por defecto: antes, un "start" sin "context" en el
+    // body caía silenciosamente a una cámara de prueba con una credencial
+    // RTSP hardcodeada, arrancando un worker real apuntado a esa cámara.
+    let context = null;
     let taskIdProvided = false;
 
     // Un body que no se puede interpretar es un 400, nunca un fallback a
@@ -654,6 +664,14 @@ export const handler = async (event) => {
         statusCode: 400,
         headers,
         body: JSON.stringify({ message: `Unknown action: ${action}` }),
+      };
+    }
+
+    if (!context) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ message: "context is required to start a worker" }),
       };
     }
 
