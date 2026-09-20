@@ -9,6 +9,7 @@ import {
 } from "@aws-sdk/client-ec2";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import crypto from "node:crypto";
 
 const ec2 = new EC2Client({ region: process.env.AWS_REGION || "us-east-1" });
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -29,7 +30,8 @@ const VLM_QUEUE_URL =
 const ANALYSIS_INSTANCE_TYPE = process.env.ANALYSIS_INSTANCE_TYPE || "m7i-flex.large";
 const MOTION_INSTANCE_TYPE = process.env.MOTION_INSTANCE_TYPE || "t3.small";
 // Secreto compartido para acciones máquina-a-máquina (el motion box despierta la
-// analysis box). Sin token de usuario; se compara en tiempo constante-ish.
+// analysis box). Sin token de usuario; se compara en tiempo constante (ver
+// safeSecretEqual) para no filtrar el secreto por temporización.
 const INTERNAL_SECRET = process.env.HEIMDALL_INTERNAL_SECRET || "";
 
 const headers = {
@@ -111,6 +113,18 @@ function getBearerToken(event) {
   }
 
   return authHeader.slice("Bearer ".length).trim();
+}
+
+// Comparación en tiempo constante del secreto interno: `===` sobre un string
+// se corta en el primer byte distinto, así que el tiempo de respuesta filtra
+// cuántos caracteres iniciales acertó el atacante. timingSafeEqual exige el
+// mismo largo en ambos buffers, así que se compara el largo aparte (una
+// longitud distinta ya descarta el match sin necesitar comparación segura).
+function safeSecretEqual(a, b) {
+  const bufA = Buffer.from(String(a), "utf8");
+  const bufB = Buffer.from(String(b), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 async function findTaskInstances(taskId, ownerUid, states) {
@@ -578,7 +592,7 @@ export const handler = async (event) => {
     // secreto compartido y se resuelve ANTES del token de usuario.
     const internalSecret =
       event?.headers?.["x-internal-secret"] || event?.headers?.["X-Internal-Secret"];
-    if (INTERNAL_SECRET && internalSecret && internalSecret === INTERNAL_SECRET) {
+    if (INTERNAL_SECRET && internalSecret && safeSecretEqual(internalSecret, INTERNAL_SECRET)) {
       let ibody = {};
       try {
         ibody = parseBody(event);
